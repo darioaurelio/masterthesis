@@ -1,0 +1,622 @@
+############################################################################################################
+## R-Script zur Masterarbeit - Part 1 - induktive, automatisierte Frame-Erfassung                         ##
+##                                                                                                        ##
+## Author: Dario Egger                                                                                    ##
+##                                                                                                        ##
+## Method taken from Walter, Ophir & Hall Jamieson 2020:                                                  ##
+## Walter D. & Ophir Y. (2019) News Frame Analysis: an Inductive Mixed Method Computational Approach.     ##
+## Communication Methods and Measures. http://dx.doi.org/10.1080/19312458.2019.1639145                    ##
+##                                                                                                        ##
+############################################################################################################
+
+
+################################ Importing Libraries
+
+options(stringsAsFactors = F)
+library(stringi) 
+library(stringr)
+library(qdapRegex)
+library(tm)
+library(ggplot2)
+library(lubridate)
+library(irr)
+library(quanteda)
+library(ldatuning)
+library(topicmodels)
+library(textcat)
+library(parallel)
+library(RSQLite)
+library(doParallel)
+library(scales)
+library(lsa)
+library(igraph)
+library(cld2) 
+library(tidyverse)
+library(dplyr)
+library(rgexf)
+library(openxlsx)
+library(rtweet)
+library(rlang)
+
+
+
+############################## Importing and Cleaning the Data
+
+setwd("/Users/Dario/Documents/R")
+
+# Read twitter data 
+text.df <- readr::read_csv("fridaysforfuture.csv")
+# limit to German tweets - based on twitter metadata
+text.de <- text.df[text.df$`Tweet Language`== "German",]
+# Convect to lower case
+text.de$tweet_text2 <- tolower(text.de$`Tweet Content`)
+# limit to German tweets as identified by google cld
+text.de$textcatcld2<- cld2::detect_language(text.de$`Tweet Content`)
+text.de<-text.de[which(text.de$textcatcld2=='de'),]
+text.df<-text.de
+rm(text.de)
+
+# setting data as date format
+# Set local time setting to english to convert time variable
+Sys.setlocale("LC_TIME", "English")
+
+# Convert created time variable to POSIXct format
+text.df$date2 <- as.POSIXct(x = data$`Tweet Posted Time (UTC)`,
+                         format = "%d %b %Y")
+
+# Continue with Analysis of Topics and Clusters
+
+# Cleaning Twitter artifacts (links, images etc.)
+text.df$tweet_text2<-gsub("[h][t][t][p][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[h][t][t][p][s][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[p][i][c][.][^[:space:]]+","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[.][c][o][m][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[w][w][w][.][^[:space:]]+","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[.][l][y][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[y][o][u][t][u][.][b][e][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[.][c][o][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[.][c][m][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[.][o][r][g][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[^[:space:]]*[w][a][p][t][o][.][s][t][^[:space:]]*","",text.df$tweet_text2)
+text.df$tweet_text2<-gsub("[&][a][m][p]"," ",text.df$tweet_text2)
+# arranging the data and renaming columns
+data <- text.df
+colnames(data)[4]<-"orig_text"
+colnames(data)[21]<-"text"
+
+# adding index column
+data$index<-seq(1,nrow(data))
+# limiting dates to relevant
+data<-data[data$date2<"2019-04-08",]
+data<-data[data$date2>"2018-09-08",]
+
+
+#########################################################################
+###########                                                       #######
+########### LDA PIPELINE- corpus and hyperparameter grid search   #######
+###########                                                       #######
+#########################################################################
+
+is.character(data$text)
+
+# removing extremely short text data
+removed_short<-subset(data,nchar(data$text)<6) 
+data2<-subset(data,!nchar(data$text)<6)
+# removing duplicate tweets for data3 and saving removed in DF. 
+# will be added after model estimation to calculate sailence of all texts
+removed_df<-data2[duplicated(data2$text),] 
+data3 <- data2[!duplicated(data2$text),]
+# sampling 10% for K and Hyperparameter optimization
+data3_10perc_numbers<-sample((1:nrow(data3)),(nrow(data3)/10),replace=FALSE)
+data3_10perc<-data3[data3_10perc_numbers,]
+# Building the corpus data - Notice the additiomal stopwords and the removal of extremly common/rare words
+mycorpus <- corpus(data3_10perc)
+stopwords_and_single<-c(stopwords("de"),LETTERS,letters, "t.co", "http", "https", "rt", "p", "amp", "via")
+dfm_counts <- dfm(mycorpus,tolower = TRUE, remove_punct = TRUE,remove_numbers=TRUE, 
+                  remove = stopwords_and_single,stem = FALSE,
+                  remove_separators=TRUE) 
+docnames(dfm_counts)<-dfm_counts@docvars$index
+# removing extemely common or rare tokens
+dfm_counts2<-dfm_trim(dfm_counts, max_docfreq = 0.95, min_docfreq=0.001,docfreq_type="prop")
+# convert to LDA-ready object
+dtm_lda <- convert(dfm_counts2, to = "topicmodels",docvars = dfm_counts2@docvars)
+full_data<-dtm_lda
+# count numer of documents for crossvalidation
+n <- nrow(full_data)
+# clean temp data
+rm(text.df)
+rm(dfm_counts)
+rm(dfm_counts2)
+
+# Run the crossvalidation loop
+print(Sys.time())
+# create container for results
+MainresultDF<-data.frame(k=c(1),perplexity=c(1),myalpha=c("x"))
+MainresultDF<-MainresultDF[-1,]
+# set possible alpha and k values
+candidate_alpha<- c(0.01, 0.05, 0.1, 0.2, 0.5) # candidates for alpha values
+candidate_k <- c(2, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120) # candidates for how many topics
+# run the 10-fold cross validation
+for (eachalpha in candidate_alpha) { 
+  print ("now running ALPHA:")
+  print (eachalpha)
+  print(Sys.time())
+  cluster <- makeCluster(detectCores(logical = TRUE) - 1) # We are leaving one Core spare. If number of corse on pc is 1, then -1 in this line should be removed.
+  registerDoParallel(cluster)
+  clusterEvalQ(cluster, {
+    library(topicmodels)
+  })
+  folds <- 10
+  splitfolds <- sample(1:folds, n, replace = TRUE)
+  clusterExport(cluster, c("full_data", "splitfolds", "folds", "candidate_k"))
+  system.time({
+    results <- foreach(j = 1:length(candidate_k), .combine = rbind) %dopar%{
+      k <- candidate_k[j]
+      print(k)
+      results_1k <- matrix(0, nrow = folds, ncol = 2)
+      colnames(results_1k) <- c("k", "perplexity")
+      for(i in 1:folds){
+        train_set <- full_data[splitfolds != i , ]
+        valid_set <- full_data[splitfolds == i, ]
+        
+        fitted <- LDA(train_set, k = k, method = "Gibbs",
+                      control = list(alpha=eachalpha) )
+        
+        results_1k[i,] <- c(k, perplexity(fitted, newdata = valid_set))
+      }
+      return(results_1k)
+    }
+  })
+  stopCluster(cluster)
+  results_df <- as.data.frame(results)
+  results_df$myalpha<-as.character(eachalpha)
+  MainresultDF<-rbind(MainresultDF,results_df)
+}
+print ("DONE!")
+print(Sys.time())
+
+# arrange and examine results
+MainresultDF$kalpha=paste0(as.character(MainresultDF$k),MainresultDF$myalpha) 
+ggplot(MainresultDF) +geom_boxplot(aes(x=k, y=perplexity, group=kalpha,color=myalpha))
+
+# run additional k and alpha values
+candidate_alpha<- c(0.01,0.05)
+candidate_k <- c(130,140,150,160) # candidates for how many topics
+for (eachalpha in candidate_alpha) { 
+  print ("now running ALPHA:")
+  print (eachalpha)
+  print(Sys.time())
+  cluster <- makeCluster(detectCores(logical = TRUE) - 1) # leave one CPU spare...
+  registerDoParallel(cluster)
+  clusterEvalQ(cluster, {
+    library(topicmodels)
+  })
+  folds <- 10
+  splitfolds <- sample(1:folds, n, replace = TRUE)
+  clusterExport(cluster, c("full_data", "splitfolds", "folds", "candidate_k"))
+  system.time({
+    results <- foreach(j = 1:length(candidate_k), .combine = rbind) %dopar%{
+      k <- candidate_k[j]
+      print(k)
+      results_1k <- matrix(0, nrow = folds, ncol = 2)
+      colnames(results_1k) <- c("k", "perplexity")
+      for(i in 1:folds){
+        train_set <- full_data[splitfolds != i , ]
+        valid_set <- full_data[splitfolds == i, ]
+        
+        fitted <- LDA(train_set, k = k, method = "Gibbs",
+                      control = list(alpha=eachalpha) )
+        
+        results_1k[i,] <- c(k, perplexity(fitted, newdata = valid_set))
+      }
+      return(results_1k)
+    }
+  })
+  stopCluster(cluster)
+  NEWresults_df <- as.data.frame(results)
+  NEWresults_df$myalpha<-as.character(eachalpha)
+  MainresultDF$kalpha<-paste0(as.character(MainresultDF$k),MainresultDF$myalpha)  
+  NEWresults_df$kalpha<-paste0(as.character(NEWresults_df$k),NEWresults_df$myalpha) 
+  MainresultDF<-rbind(MainresultDF,NEWresults_df)
+}
+print ("DONE!")
+print(Sys.time())
+# examine results
+ggplot(MainresultDF) +
+  geom_boxplot(aes(x=k, y=perplexity, group=kalpha,color=myalpha))+
+  geom_smooth(se = TRUE, aes(x=k, y=perplexity,color=myalpha))
+
+# run last k values
+candidate_alpha<- c(0.01)
+candidate_k <- c(170,180,190,200) # candidates for how many topics
+for (eachalpha in candidate_alpha) { 
+  print ("now running ALPHA:")
+  print (eachalpha)
+  print(Sys.time())
+  cluster <- makeCluster(detectCores(logical = TRUE) - 1) # leave one CPU spare...
+  registerDoParallel(cluster)
+  clusterEvalQ(cluster, {
+    library(topicmodels)
+  })
+  folds <- 10
+  splitfolds <- sample(1:folds, n, replace = TRUE)
+  clusterExport(cluster, c("full_data", "splitfolds", "folds", "candidate_k"))
+  system.time({
+    results <- foreach(j = 1:length(candidate_k), .combine = rbind) %dopar%{
+      k <- candidate_k[j]
+      print(k)
+      results_1k <- matrix(0, nrow = folds, ncol = 2)
+      colnames(results_1k) <- c("k", "perplexity")
+      for(i in 1:folds){
+        train_set <- full_data[splitfolds != i , ]
+        valid_set <- full_data[splitfolds == i, ]
+        
+        fitted <- LDA(train_set, k = k, method = "Gibbs",
+                      control = list(alpha=eachalpha) )
+        
+        results_1k[i,] <- c(k, perplexity(fitted, newdata = valid_set))
+      }
+      return(results_1k)
+    }
+  })
+  stopCluster(cluster)
+  NEWresults_df <- as.data.frame(results)
+  NEWresults_df$myalpha<-as.character(eachalpha)
+  MainresultDF$kalpha<-paste0(as.character(MainresultDF$k),MainresultDF$myalpha)  
+  NEWresults_df$kalpha<-paste0(as.character(NEWresults_df$k),NEWresults_df$myalpha) 
+  MainresultDF<-rbind(MainresultDF,NEWresults_df)
+}
+print ("DONE!")
+print(Sys.time())
+
+# examine full k and alpha resutls
+ggplot(MainresultDF) +
+  geom_boxplot(aes(x=k, y=perplexity, group=kalpha,color=myalpha))+
+  scale_color_discrete(name = "Alpha Levels")+
+  xlab("K (Number of Topics)")+
+  ylab("Perplexity")
+# Identify 2nd derivative max point on perplexity  
+MainresultDF_MYALPHA<-MainresultDF[MainresultDF$myalpha==0.01,]
+cars.spl <- with(MainresultDF_MYALPHA, smooth.spline(k, perplexity, df = 3))
+plot(with(cars, predict(cars.spl, x = MainresultDF_MYALPHA$k, deriv = 2)), type = "l")
+abline(v=50)
+
+# Run LDA with optimal values of alpha 0.01 and k=50 on full data
+mycorpus <- corpus(data3)
+stopwords_and_single<-c(stopwords("de"),LETTERS,letters, "t.co", "http", "https", "rt", "p", "amp", "via")
+dfm_counts <- dfm(mycorpus,tolower = TRUE, remove_punct = TRUE,remove_numbers=TRUE, 
+                  remove = stopwords_and_single,stem = FALSE,
+                  remove_separators=TRUE) 
+docnames(dfm_counts)<-dfm_counts@docvars$`Tweet Id`
+dtm_lda <- convert(dfm_counts, to = "topicmodels",docvars = dfm_counts@docvars)
+
+
+LDA.50 <- LDA(dtm_lda, k = 50, method = "Gibbs",control = list(alpha=0.01,seed=125231)) 
+LDAfit<-LDA.50
+
+
+#########################################################################
+###########                                                       #######
+###########            Analyzing the Topics                       #######
+###########                                                       #######
+#########################################################################
+
+### Extrating unique words for topic (FREX words)
+mybeta<-data.frame(LDAfit@beta)
+colnames(mybeta)<-LDAfit@terms
+mybeta<-t(mybeta)
+colnames(mybeta)<-seq(1:ncol(mybeta))
+mybeta=exp(mybeta)
+
+# Printing main files for analysis (WORDS/FREX/TEXTS)
+nwords=50
+topwords <- mybeta[1:nwords,]
+for (i in 1:LDAfit@k) {
+  tempframe <- mybeta[order(-mybeta[,i]),]
+  tempframe <- tempframe[1:nwords,]
+  tempvec<-as.vector(rownames(tempframe))
+  topwords[,i]<-tempvec
+}
+rownames(topwords)<-c(1:nwords)
+write.xlsx(topwords, "TopWords_Fridays_v3.xlsx")
+
+
+### Print top 30 documents
+metadf<-data3
+# notice that the "text" column is again named "text". If column name is different, name "text" needs to be changed.
+meta_theta_df<-cbind(metadf[,"text"],LDAfit@gamma)
+ntext=30
+toptexts <- mybeta[1:ntext,]
+for (i in 1:LDAfit@k) {
+  print(i)
+  tempframe <- meta_theta_df[order(-as.numeric(meta_theta_df[,i+1])),]
+  tempframe <- tempframe[1:ntext,]
+  tempvec<-as.vector(tempframe[,1])
+  toptexts[,i]<-tempvec
+}
+rownames(toptexts)<-c(1:ntext)
+write.xlsx(toptexts, "TopTexts_Fridays_v3.xlsx")
+
+# change myw to change the weight given to uniqueness
+myw=0.3
+word_beta_sums<-rowSums(mybeta)
+my_beta_for_frex<-mybeta
+for (m in 1:ncol(my_beta_for_frex)) {
+  for (n in 1:nrow(my_beta_for_frex)) {
+    my_beta_for_frex[n,m]<-1/(myw/(my_beta_for_frex[n,m]/word_beta_sums[n])+((1-myw)/my_beta_for_frex[n,m]))
+  }
+  print (m)
+}
+nwords=50
+topfrex <- my_beta_for_frex[1:nwords,]
+for (i in 1:LDAfit@k) {
+  tempframe <- my_beta_for_frex[order(-my_beta_for_frex[,i]),]
+  tempframe <- tempframe[1:nwords,]
+  tempvec<-as.vector(rownames(tempframe))
+  topfrex[,i]<-tempvec
+}
+rownames(topfrex)<-c(1:nwords)
+write.xlsx(topfrex, "TopFREXWords_Fridays_v3.xlsx")
+
+
+# Running ANTMN function - Walter and Ophir (2019) News Frame Analysis. Communication Methods and Measures 13(4), 248-266  
+
+network_from_LDA<-function(LDAobject,deleted_topics=c(),topic_names=c(),save_filename="",topic_size=c()) {
+# Importing needed packages
+require(lsa) # for cosine similarity calculation
+require(dplyr) # general utility
+require(igraph) # for graph/network managment and output
+  
+print("Importing model")
+  
+# first extract the theta matrix form the topicmodel object
+theta<-LDAobject@gamma
+# adding names for culumns based on k
+colnames(theta)<-c(1:LDAobject@k)
+  
+  # claculate the adjacency matrix using cosine similarity on the theta matrix
+  mycosine<-cosine(as.matrix(theta))
+  colnames(mycosine)<-colnames(theta)
+  rownames(mycosine)<-colnames(theta)
+  
+  # Convert to network - undirected, weighted, no diagonal
+  
+  print("Creating graph")
+  
+  topmodnet<-graph.adjacency(mycosine,mode="undirected",weighted=T,diag=F,add.colnames="label") # Assign colnames
+  # add topicnames as name attribute of node - importend from prepare meta data in previous lines
+  if (length(topic_names)>0) {
+    print("Topic names added")
+    V(topmodnet)$name<-topic_names
+  } 
+  # add sizes if passed to funciton
+  if (length(topic_size)>0) {
+    print("Topic sizes added")
+    V(topmodnet)$topic_size<-topic_size
+  }
+  newg<-topmodnet
+  
+  # delete 'garbage' topics
+  if (length(deleted_topics)>0) {
+    print("Deleting requested topics")
+    
+    newg<-delete_vertices(topmodnet, deleted_topics)
+  }
+  
+  # run community detection and attach as node attribute
+  print("Calculating communities")
+  
+  mylouvain<-(cluster_louvain(newg)) 
+  mywalktrap<-(cluster_walktrap(newg)) 
+  myspinglass<-(cluster_spinglass(newg)) 
+  myfastgreed<-(cluster_fast_greedy(newg)) 
+  myeigen<-(cluster_leading_eigen(newg)) 
+  
+  V(newg)$louvain<-mylouvain$membership 
+  V(newg)$walktrap<-mywalktrap$membership 
+  V(newg)$spinglass<-myspinglass$membership 
+  V(newg)$fastgreed<-myfastgreed$membership 
+  V(newg)$eigen<-myeigen$membership 
+  
+  # if filename is passsed - saving object to graphml object. Can be opened with Gephi.
+  if (nchar(save_filename)>0) {
+    print("Writing graph")
+    write.graph(newg,paste0(save_filename,".graphml"),format="graphml")
+  }
+  
+  # graph is returned as object
+  return(newg)
+}
+
+# add topic labels based on manual annotation
+custom_topic_labels <-c('Schule schwänzen','Organisation von Demos','Anti AFD','Europawahl','Hambacherforst weg','Strafen für Schwänzen','Klimagerechtigkeit',
+           'Bussgelder','Klimanotstand in NRW','Legitimation von Demos','Regionale Demos','Einhaltung des Klimaabkommen','Verkehrswende','Greta Thunberg','Kohleausstieg','Greta Thunberg in Deutschland',
+           'Unfähigkeit der Politik','Solidarität für Aktivisten','Schüler machen Politik','Artefakt','Freitag ist Klimastreik','Frauenstreik','Zukunft der Kinder','Politik muss handeln','Artefakt',
+           'Fridays For Future auf politischer Agenda','Solidarität - Nachhilfeangebot','Internationale Dynastien & Mulinationale Konzerne','Artefakt','Nicht wütend genug','Mehr Klimaschutz, weniger Co2','Mediale Aufmerksamkeit','Fliegen ist klimaschädlich',
+           'Artefakt','Artefakt','Artefakt','Fracking','Unterstützung von Eltern & Wissenschaftler','Politische Debatten zu Fridays For Future','Euphorie','Verkehrswende & Tempolimit',
+           'Umweltminister müssen handeln','Lovestorm für Greta','Aufruf zum Protest','Kohleausstieg','Klimakrise','Artefakt','Artefakt','Fernsehbeiträge',
+           'Artefakt')
+
+
+# calculate 
+topic.frequency <- colSums(meta_theta_df[,1:ncol(meta_theta_df)]*as.vector(meta_theta_df[,1]))
+topic.proportion <- topic.frequency/sum(topic.frequency)
+
+mynewnet<-network_from_LDA(LDAobject=LDAfit,
+                           deleted_topics=c(20,25,29,34,35,36,47,48,50),
+                           topic_names=custom_topic_labels,
+                           save_filename="Network_Fridays_v2")
+
+
+
+#view the topic assignment for each document
+topics(LDAfit)
+
+#create a matrix 
+LDAfit.topics <- as.data.frame(topics(LDAfit))
+
+LDAfit.topics$id <-as.factor(rownames(LDAfit.topics))
+
+LDAfit.topics$id <- str_replace_all(LDAfit.topics$id, '\"', "")
+
+rownames(LDAfit.topics) <- dfm_counts@docvars$index
+
+#Include Frame Variable from manual annotations
+LDAfit.topics$frame <- ""
+
+LDAfit.topics <- LDAfit.topics %>% 
+  within(frame[`topics(LDAfit)`%in% c(7, 9, 12, 17, 23, 28, 33, 37, 42, 46)] <- 'Diagnostic') %>% 
+  within(frame[`topics(LDAfit)`%in% c(1, 13, 15, 31, 41, 45)] <- 'Prognostic') %>% 
+  within(frame[`topics(LDAfit)`%in% c(18, 21, 27, 30, 38, 40, 44)] <- 'Motivational')
+
+LDAfit.topics$topic <- ""
+
+# add labels to topic variable
+LDAfit.topics <- LDAfit.topics %>% 
+  within(topic[`topics(LDAfit)`%in% c(1)] <- 'Schule schwänzen') %>% 
+  within(topic[`topics(LDAfit)`%in% c(2)] <- 'Organisation von Demos') %>% 
+  within(topic[`topics(LDAfit)`%in% c(3)] <- 'Anti AFD') %>% 
+  within(topic[`topics(LDAfit)`%in% c(4)] <- 'Europawahl') %>% 
+  within(topic[`topics(LDAfit)`%in% c(5)] <- 'Hambacherforst weg') %>% 
+  within(topic[`topics(LDAfit)`%in% c(6)] <- 'Strafen für Schwänzen') %>% 
+  within(topic[`topics(LDAfit)`%in% c(7)] <- 'Klimagerechtigkeit') %>% 
+  within(topic[`topics(LDAfit)`%in% c(8)] <- 'Bussgelder') %>% 
+  within(topic[`topics(LDAfit)`%in% c(9)] <- 'Klimanotstand in NRW') %>% 
+  within(topic[`topics(LDAfit)`%in% c(10)] <- 'Legitimation von Demos') %>% 
+  within(topic[`topics(LDAfit)`%in% c(11)] <- 'Regionale Demos') %>% 
+  within(topic[`topics(LDAfit)`%in% c(12)] <- 'Einhaltung des Klimaabkommen') %>% 
+  within(topic[`topics(LDAfit)`%in% c(13)] <- 'Verkehrswende') %>% 
+  within(topic[`topics(LDAfit)`%in% c(14)] <- 'Greta Thunberg') %>% 
+  within(topic[`topics(LDAfit)`%in% c(15)] <- 'Kohleausstieg') %>% 
+  within(topic[`topics(LDAfit)`%in% c(16)] <- 'Greta Thunberg in Deutschland') %>% 
+  within(topic[`topics(LDAfit)`%in% c(17)] <- 'Unfähigkeit der Politik') %>% 
+  within(topic[`topics(LDAfit)`%in% c(18)] <- 'Solidarität für Aktivisten') %>% 
+  within(topic[`topics(LDAfit)`%in% c(19)] <- 'Schüler machen Politik') %>% 
+  within(topic[`topics(LDAfit)`%in% c(20)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(21)] <- 'Freitag ist Klimastreik') %>% 
+  within(topic[`topics(LDAfit)`%in% c(22)] <- 'Frauenstreik') %>% 
+  within(topic[`topics(LDAfit)`%in% c(23)] <- 'Zukunft der Kinder') %>% 
+  within(topic[`topics(LDAfit)`%in% c(24)] <- 'Politik muss handeln') %>% 
+  within(topic[`topics(LDAfit)`%in% c(25)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(26)] <- 'Fridays For Future auf politischer Agenda') %>% 
+  within(topic[`topics(LDAfit)`%in% c(27)] <- 'Solidarität - Nachhilfeangebot') %>% 
+  within(topic[`topics(LDAfit)`%in% c(28)] <- 'Internationale Dynastien & Mulinationale Konzerne') %>% 
+  within(topic[`topics(LDAfit)`%in% c(29)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(30)] <- 'Nicht wütend genug') %>% 
+  within(topic[`topics(LDAfit)`%in% c(31)] <- 'Mehr Klimaschutz, weniger Co2') %>% 
+  within(topic[`topics(LDAfit)`%in% c(32)] <- 'Mediale Aufmerksamkeit') %>% 
+  within(topic[`topics(LDAfit)`%in% c(33)] <- 'Fliegen ist klimaschädlich') %>% 
+  within(topic[`topics(LDAfit)`%in% c(34)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(35)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(36)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(37)] <- 'Fracking') %>% 
+  within(topic[`topics(LDAfit)`%in% c(38)] <- 'Unterstützung von Eltern & Wissenschaftler') %>% 
+  within(topic[`topics(LDAfit)`%in% c(39)] <- 'Politische Debatten zu Fridays For Future') %>% 
+  within(topic[`topics(LDAfit)`%in% c(40)] <- 'Euphorie') %>% 
+  within(topic[`topics(LDAfit)`%in% c(41)] <- 'Verkehrswende & Tempolimit') %>% 
+  within(topic[`topics(LDAfit)`%in% c(42)] <- 'Umweltminister müssen handeln') %>% 
+  within(topic[`topics(LDAfit)`%in% c(43)] <- 'Lovestorm für Greta') %>% 
+  within(topic[`topics(LDAfit)`%in% c(44)] <- 'Aufruf zum Protest') %>% 
+  within(topic[`topics(LDAfit)`%in% c(45)] <- 'Kohleausstieg') %>% 
+  within(topic[`topics(LDAfit)`%in% c(46)] <- 'Klimakrise') %>% 
+  within(topic[`topics(LDAfit)`%in% c(47)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(48)] <- 'Artefakt') %>% 
+  within(topic[`topics(LDAfit)`%in% c(49)] <- 'Fernsehbeiträge') %>% 
+  within(topic[`topics(LDAfit)`%in% c(50)] <- 'Artefakt') 
+
+data3 <- data3  %>% 
+  rename(
+    id = `Tweet Id`)
+
+data3$id <- str_replace_all(data3$id, '\"', "")
+
+# creat full data-set for all topics inclusing all tweets and measures
+full_topics_data <- merge(LDAfit.topics, data3, by = "id")
+
+full_topics_data2 <- select(full_topics_data, topic, created_at)
+
+full_topics_data3 <- full_topics_data2 %>%
+  group_by(topic,created_at) %>% 
+  mutate(n = n()) 
+
+full_topics_data$
+
+full_topics_data <- full_topics_data  %>% 
+  rename(
+    created_at = date2)
+
+# Subset data-set for all annotated collective action frames
+full_frames_data <- subset(full_topics_data, frame %in% c("Prognostic", "Diagnostic", "Motivational"))
+
+full_frames_data2 <- select(full_frames_data, frame, created_at)
+
+full_frames_data3 <- full_frames_data2 %>%
+  group_by(frame,created_at) %>% 
+  mutate(n = n()) 
+  
+
+##################################################
+### Import Comment Data for Sentiment Analysis ###
+##################################################
+
+### 1. Load Data (set to the patch where you've safed the downloaded Facebook-Files)
+comments1 <- readr::read_csv("Comments Twitter_1-400.csv")
+comments2 <- readr::read_csv("Comments Twitter_401-801.csv")
+comments3 <- readr::read_csv("Comments Twitter_rest.csv")
+
+
+### 2. Create full Data Sets 
+comments_fullstats <- bind_rows(comments1, comments2, comments3)
+
+rm(comments1, comments2, comments3)
+
+
+comments_fullstats <- comments_fullstats  %>% 
+  rename(
+    id = tweetId)
+
+comments_fullstats$id <- as.factor(comments_fullstats$id)
+
+
+# Subset and merge comment data with topic data
+
+LDAfit.topics_sample <- subset(LDAfit.topics, id  %in% comments_fullstats$id)
+
+prognostic_sample <- subset(LDAfit.topics_sample, frame == "Prognostic")
+diagnostic_sample <- subset(LDAfit.topics_sample, frame == "Diagnostic")
+motivational_sample <- subset(LDAfit.topics_sample, frame == "Motivational")
+
+diagnostic_sample_2 <- sample_n(diagnostic_sample, 22)
+motivational_sample_2 <- sample_n(motivational_sample, 22)
+
+frame_sample <- bind_rows(prognostic_sample, diagnostic_sample_2, motivational_sample_2)
+
+# Subset and merge comment data with topic data
+merged.data <- merge(LDAfit.topics, comments_fullstats, by = "id")
+n_distinct(merged.data2$id)
+
+merged.data <- merged.data %>% 
+  within(frame[id == 1106511214040006656] <- "Diagnostic") %>% 
+  within(frame[id == 1086204933576314880] <- "Diagnostic") %>% 
+  within(frame[id == 1086319016992489472] <- "Diagnostic") %>% 
+  within(frame[id == 1088016493567266816] <- "Diagnostic") %>% 
+  within(frame[id == 1093212464580382720] <- "Diagnostic") %>%
+  within(frame[id == 1093766375196250112] <- "Diagnostic") %>%
+  within(frame[id == 1095393771922096128] <- "Diagnostic") %>%
+  within(frame[id == 1096290416721358848] <- "Diagnostic") %>%
+  within(frame[id == 1098657058398892032] <- "Diagnostic") %>%
+  within(frame[id == 1099024927800332288] <- "Diagnostic") %>%
+  within(frame[id == 1103980945399578624] <- "Diagnostic") %>%
+  within(frame[id == 1105429652506636288] <- "Diagnostic") %>%
+  within(frame[id == 1105735817778073600] <- "Diagnostic") %>%
+  within(frame[id == 1106473111443120128] <- "Diagnostic") %>%
+  within(frame[id == 1106624505944965120] <- "Diagnostic") %>%
+  within(frame[id == 1109065269702524928] <- "Diagnostic") %>%
+  within(frame[id == 1111563566858072064] <- "Diagnostic") %>%
+  within(frame[id == 1112653850463354880] <- "Diagnostic") %>%
+  within(frame[id == 1113818507928584192] <- "Diagnostic") %>%
+  within(frame[id == 1114117435668553728] <- "Diagnostic")
+
+# export comment data for sentiment analysis 
+write.csv(merged.data,"full_comment_data.csv")
+

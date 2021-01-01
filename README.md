@@ -7,5 +7,5 @@ Beinhaltet sämtliche Datensätze, sowie die R-Script Dateien zur Aufbereitung u
 
 Datensatz:
 
-- fridaysforfuture.csv (55'919 original tweets collected using #FridaysForFuture and lang = German
+- fridaysforfuture.csv (55'919 original tweets collected using #FridaysForFuture and lang = German)
 - comments.csv (11'867 comments based on subsample of 994 tweets from fridaysforfuture dataset)

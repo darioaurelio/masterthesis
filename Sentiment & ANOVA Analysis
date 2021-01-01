@@ -1,0 +1,136 @@
+#####################################################################   
+## R-Script zur Masterarbeit                                       ##
+##                                                                 ##
+## Sentiment Analysis &                                            ##                                               
+##      Multiple pairwise-comparision between the means of groups  ##
+##                                                                 ##
+## Author: Dario Egger                                             ##
+##                                                                 ##
+#####################################################################
+
+# create function to read and process SentiWS Dictonary
+readAndflattenSentiWS <- function(filename) { 
+  words = readLines(filename, encoding="UTF-8")
+  words <- sub("\\|[A-Z]+\t[0-9.-]+\t?", ",", words)
+  words <- unlist(strsplit(words, ","))
+  words <- tolower(words)
+  return(words)
+}
+
+# set wd
+setwd("/Users/Dario/Documents/R")
+
+# load positive and negative SentiWS lists
+pos.words <- c(scan("SentiWS_2.0_Positive.txt",what='character', comment.char=';', quiet=T), 
+               readAndflattenSentiWS("SentiWS_v1.8c_Positive.txt"))
+neg.words <- c(scan("SentiWS_v2.0_Negative.txt",what='character', comment.char=';', quiet=T), 
+               readAndflattenSentiWS("SentiWS_v1.8c_Negative.txt"))
+
+
+# write function to score comment data retreived from frame analysis
+score.sentiment = function(sentences, pos.words, neg.words, .progress='none') {
+  require(plyr)
+  require(stringr)
+  scores = laply(sentences, function(sentence, pos.words, neg.words) 
+  {
+    # clean up sentences with R's regex-driven global substitute, gsub():
+    sentence = gsub('[[:punct:]]', '', sentence)
+    sentence = gsub('[[:cntrl:]]', '', sentence)
+    sentence = gsub('\\d+', '', sentence)
+    # and convert to lower case:
+    sentence = tolower(sentence)
+    # split into words. str_split is in the stringr package
+    word.list = str_split(sentence, '\\s+')
+    # sometimes a list() is one level of hierarchy too much
+    words = unlist(word.list)
+    # compare our words to the dictionaries of positive & negative terms
+    pos.matches = match(words, pos.words)
+    neg.matches = match(words, neg.words)
+    # match() returns the position of the matched term or NA
+    # we just want a TRUE/FALSE:
+    pos.matches = !is.na(pos.matches)
+    neg.matches = !is.na(neg.matches)
+    # and conveniently enough, TRUE/FALSE will be treated as 1/0 by sum():
+    score = (mean(pos.matches) - mean(neg.matches))
+    return(score)
+  }, 
+  pos.words, neg.words, .progress=.progress )
+  scores.df = data.frame(score=scores)
+  return(scores.df)
+}
+
+
+# Reading Data
+new_twitter <- read.csv("sample_comments_fridays.csv")
+
+# Assign Sentiment Scores to comments
+new_twitter$comment_score <- score.sentiment(new_twitter$Content, 
+                                        pos.words, 
+                                        neg.words)
+
+# Assign Sentiment Scores to originaltweets
+new_twitter$Original_score<- score.sentiment(new_twitter$Original_post_content, 
+                                                      pos.words, 
+                                                      neg.words)
+
+
+# subset comment data to receive all that with values for variable 'Collective Action Frame'
+new_twitter_sub <- subset(new_twitter, frame %in% c("Prognostic", "Diagnostic", "Motivational"))
+
+
+# calculate anova for hypothesis test
+levels(new_twitter_sub$frame)
+
+new_twitter_sub$frame <- ordered(new_twitter_sub$frame,
+                         levels = c("Diagnostic", "Prognostic", "Motivational"))
+
+twitter_reg <- dplyr::select(new_twitter_sub, score, frame)
+
+group_by(twitter_reg, frame) %>%
+  summarise(
+    dplyr::count = n(),
+    mean = mean(score, na.rm = TRUE),
+    sd = sd(score, na.rm = TRUE)
+  )
+
+
+# Install
+if(!require(devtools)) install.packages("devtools")
+devtools::install_github("kassambara/ggpubr")
+
+library("ggpubr")
+ggboxplot(twitter_reg, x = "frame", y = "score", 
+          color = "frame", palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+          order = c("Diagnostic", "Prognostic", "Motivational"),
+          ylab = "score", xlab = "Treatment")
+
+ggline(twitter_reg, x = "frame", y = "score", 
+       add = c("mean_se", "jitter"), 
+       order = c("Diagnostic", "Prognostic", "Motivational"),
+       ylab = "score", xlab = "Treatment")
+
+
+# Compute the analysis of variance
+res.aov <- aov(score ~ frame, data = twitter_reg)
+# Summary of the analysis
+summary(res.aov)
+
+# Compute multiple-pairwise analysis of variance
+TukeyHSD(res.aov)
+
+
+# Plot residuals
+plot(res.aov, 1)
+
+library(multcomp)
+glht(model, lincft)
+
+summary(glht(res.aov, linfct = mcp(frame = "Tukey")))
+
+# test
+aov_residuals <- residuals(object = res.aov )
+# Run Shapiro-Wilk test
+shapiro.test(x = aov_residuals )
+
+plot(res.aov, 2)
+
